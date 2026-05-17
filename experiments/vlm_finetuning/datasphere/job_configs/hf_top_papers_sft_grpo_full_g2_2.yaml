@@ -1,6 +1,9 @@
 name: hf-top-papers-qwen3vl-8b-sft-grpo-g2-2
 
-desc: Full SFT plus GRPO VLM fine-tuning for Qwen3-VL-8B-Instruct on top-papers/top-papers-graph-experts-data, g2.2 A100 x2, 1 TB SSD
+desc: >
+  Budget-guarded full SFT plus GRPO VLM fine-tuning for Qwen3-VL-8B-Instruct
+  on top-papers/top-papers-graph-experts-data export exports/colab-run-001,
+  DataSphere g2.2 A100 x2, 1 TB SSD, hard project budget guard below 100000 RUB.
 
 cmd: >
   bash experiments/vlm_finetuning/datasphere/bin/run_hf_top_papers_sft_grpo_full.sh
@@ -15,22 +18,88 @@ env:
       - data/
       - examples/
   vars:
+    # Hugging Face source. The export mode intentionally reads the prepared
+    # TRL-compatible files exports/colab-run-001/sft.jsonl and grpo.jsonl.
     - HF_DATASET_ID: top-papers/top-papers-graph-experts-data
+    - HF_DATASET_REVISION: main
+    - HF_DATASET_SOURCE_MODE: export
+    - HF_DATASET_EXPORT_SUBDIR: exports/colab-run-001
     - HF_DATASET_SPLIT: validation
+    - EVAL_RATIO: "0.10"
+    - MAX_IMAGES_PER_EXAMPLE_SFT: 3
+    - MAX_IMAGES_PER_EXAMPLE_GRPO: 2
+
+    # Base model and output names.
     - BASE_MODEL: Qwen/Qwen3-VL-8B-Instruct
     - OUT_PREFIX: hf_top_papers_qwen3vl_8b
+
+    # Hugging Face model repository upload. Store HF_TOKEN/HUGGING_FACE_HUB_TOKEN
+    # as a DataSphere secret or environment variable; never commit the token.
     - HF_UPLOAD_AFTER_TRAINING: "1"
     - HF_REPO_ID: top-papers/Qwen3-VL-8B-Instruct-scireason
     - HF_REPO_TYPE: model
     - HF_REVISION: main
     - HF_UPLOAD_PATH_PREFIX: ""
+    - HF_UPLOAD_TIMEOUT_HOURS: 1
+
+    # Conservative budget guard. Official DataSphere billing is per second,
+    # but job data storage/logs are charged separately, so 5000 RUB is reserved.
     - BUDGET_RUB: 100000
+    - BUDGET_RESERVE_RUB: 5000
+    - BUDGET_SHUTDOWN_MARGIN_SECONDS: 900
     - G2_2_RUB_PER_HOUR: 1085.76
-    - MAX_SFT_STEPS: 180
-    - MAX_GRPO_STEPS: 80
-    - DATA_TIMEOUT_HOURS: 4
-    - SFT_TIMEOUT_HOURS: 30
-    - GRPO_TIMEOUT_HOURS: 45
+
+    # Timeouts are chosen to spend the available budget aggressively but keep
+    # the worst-case compute cost at about 94461.12 RUB before storage/rounding.
+    - DATA_TIMEOUT_HOURS: 3
+    - SFT_TIMEOUT_HOURS: 48
+    - GRPO_TIMEOUT_HOURS: 35
+
+    # Training budget. Increase only together with recomputing the budget plan.
+    - MAX_SFT_STEPS: 480
+    - MAX_GRPO_STEPS: 160
+    - SFT_EPOCHS: 4
+    - GRPO_EPOCHS: 1
+
+    # SFT hyperparameters.
+    - SFT_LR: "7e-5"
+    - SFT_WARMUP_RATIO: "0.05"
+    - SFT_LR_SCHEDULER: cosine
+    - SFT_WEIGHT_DECAY: "0.01"
+    - SFT_MAX_GRAD_NORM: "0.3"
+    - SFT_LORA_R: 32
+    - SFT_LORA_ALPHA: 64
+    - SFT_LORA_DROPOUT: "0.05"
+    - SFT_PER_DEVICE_BATCH: 1
+    - SFT_GRAD_ACCUM: 8
+    - SFT_SAVE_STEPS: 60
+    - SFT_EVAL_STEPS: 60
+    - SFT_DATALOADER_NUM_WORKERS: 4
+
+    # GRPO hyperparameters. Effective global batch is 2 GPU * 1 batch * 8 grad_accum = 16,
+    # divisible by num_generations=2.
+    - GRPO_LR: "1e-5"
+    - GRPO_WARMUP_RATIO: "0.08"
+    - GRPO_LR_SCHEDULER: cosine
+    - GRPO_MAX_GRAD_NORM: "0.3"
+    - GRPO_PER_DEVICE_BATCH: 1
+    - GRPO_GRAD_ACCUM: 8
+    - GRPO_NUM_GENERATIONS: 2
+    - GRPO_NUM_GENERATIONS_EVAL: 2
+    - GRPO_MAX_COMPLETION_LENGTH: 384
+    - GRPO_TEMPERATURE: "0.8"
+    - GRPO_TOP_P: "0.95"
+    - GRPO_TOP_K: 0
+    - GRPO_IMPORTANCE_SAMPLING_LEVEL: sequence
+    - GRPO_MULTI_OBJECTIVE_AGGREGATION: normalize_then_sum
+    - GRPO_REWARD_WEIGHTS: "0.0 1.0 0.8 1.2 0.5 1.5"
+    - GRPO_SAVE_STEPS: 40
+    - GRPO_EVAL_STEPS: 40
+    - GRPO_DATALOADER_NUM_WORKERS: 2
+
+    # VLM memory and speed guardrails.
+    - ATTN_IMPLEMENTATION: auto
+    - VLM_MAX_PIXELS: 1003520
     - TOKENIZERS_PARALLELISM: "false"
     - PYTHONUNBUFFERED: "1"
 
@@ -41,8 +110,14 @@ inputs:
 
 outputs:
   - data/derived/hf_top_papers_graph_experts/summary.json
+  - data/derived/hf_top_papers_graph_experts/README.md
+  - data/derived/hf_top_papers_graph_experts/export_summary.json
+  - data/derived/hf_top_papers_graph_experts/ARTICLE_IMAGE_SOURCES.md
+  - data/derived/hf_top_papers_graph_experts/article_image_sources.jsonl
+  - data/derived/hf_top_papers_graph_experts/sft_all.jsonl
   - data/derived/hf_top_papers_graph_experts/sft_train.jsonl
   - data/derived/hf_top_papers_graph_experts/sft_eval.jsonl
+  - data/derived/hf_top_papers_graph_experts/grpo_all.jsonl
   - data/derived/hf_top_papers_graph_experts/grpo_train.jsonl
   - data/derived/hf_top_papers_graph_experts/grpo_eval.jsonl
   - outputs/hf_top_papers_qwen3vl_8b_sft_lora.tar.gz

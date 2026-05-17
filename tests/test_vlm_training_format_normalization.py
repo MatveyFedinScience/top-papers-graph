@@ -30,6 +30,7 @@ def _install_training_stubs(monkeypatch):
     for attr in [
         "AutoProcessor",
         "AutoTokenizer",
+        "AutoModelForImageTextToText",
         "BitsAndBytesConfig",
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",

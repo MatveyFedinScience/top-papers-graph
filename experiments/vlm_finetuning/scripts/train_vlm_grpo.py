@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import inspect
+import importlib.util
 import json
 import os
 import re
@@ -20,10 +22,23 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
-    Qwen2_5_VLForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
     set_seed,
 )
+
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # pragma: no cover - compatibility with older Transformers aliases
+    from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
+
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback to AutoModelForImageTextToText
+    Qwen3VLForConditionalGeneration = None
+
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback to AutoModelForImageTextToText
+    Qwen2_5_VLForConditionalGeneration = None
 from trl import GRPOConfig, GRPOTrainer
 
 # Parsing and logging
@@ -356,10 +371,49 @@ def reward_expert_override_match(prompts, completions, expected_verdict=None, sa
 
 # 3. Dataset and model preparation
 
+def _supports_kwargs(callable_obj: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter config kwargs for compatibility across TRL versions and lightweight tests."""
+    try:
+        sig = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return kwargs
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _flash_attn_available() -> bool:
+    return importlib.util.find_spec('flash_attn') is not None
+
+
+def resolve_attn_implementation(attn_impl: str) -> str:
+    if attn_impl == 'auto':
+        return 'flash_attention_2' if _flash_attn_available() else 'sdpa'
+    if attn_impl == 'flash_attention_2' and not _flash_attn_available():
+        print('[train_vlm_grpo] flash_attn is not installed; falling back to sdpa.', flush=True)
+        return 'sdpa'
+    return attn_impl
+
+
+def load_processor(model_id: str, min_pixels: int | None, max_pixels: int | None, trust_remote_code: bool = False):
+    kwargs: Dict[str, Any] = {'trust_remote_code': trust_remote_code}
+    if min_pixels is not None:
+        kwargs['min_pixels'] = min_pixels
+    if max_pixels is not None:
+        kwargs['max_pixels'] = max_pixels
+    try:
+        return AutoProcessor.from_pretrained(model_id, **kwargs)
+    except TypeError:
+        kwargs.pop('min_pixels', None)
+        kwargs.pop('max_pixels', None)
+        return AutoProcessor.from_pretrained(model_id, **kwargs)
+
+
 def get_local_rank() -> int:
     return int(os.environ.get('LOCAL_RANK', '0'))
 
-def load_qwen_model(model_id: str, qlora: bool, bf16: bool, fp16: bool, attn_impl: str):
+def load_qwen_model(model_id: str, qlora: bool, bf16: bool, fp16: bool, attn_impl: str, trust_remote_code: bool = False):
     torch_dtype = torch.bfloat16 if bf16 else torch.float16 if fp16 else None
     quant_config = None
     device_map = None
@@ -373,17 +427,25 @@ def load_qwen_model(model_id: str, qlora: bool, bf16: bool, fp16: bool, attn_imp
         )
         device_map = {'': get_local_rank()} if torch.cuda.is_available() else None
 
-    kwargs = {'attn_implementation': attn_impl}
+    kwargs = {'attn_implementation': resolve_attn_implementation(attn_impl), 'trust_remote_code': trust_remote_code}
     if torch_dtype is not None: kwargs['torch_dtype'] = torch_dtype
     if quant_config is not None: kwargs['quantization_config'] = quant_config
     if device_map is not None: kwargs['device_map'] = device_map
 
-    if 'Qwen3-VL' in model_id: 
-        return Qwen3VLForConditionalGeneration.from_pretrained(model_id, **kwargs)
-    elif 'Qwen2.5-VL' in model_id or 'Qwen2-VL' in model_id: 
-        return Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **kwargs)
+    if 'Qwen3-VL' in model_id and Qwen3VLForConditionalGeneration is not None:
+        model_cls = Qwen3VLForConditionalGeneration
+    elif ('Qwen2.5-VL' in model_id or 'Qwen2-VL' in model_id) and Qwen2_5_VLForConditionalGeneration is not None:
+        model_cls = Qwen2_5_VLForConditionalGeneration
     else:
-        raise ValueError(f'Unsupported model: {model_id}')
+        model_cls = AutoModelForImageTextToText
+    try:
+        return model_cls.from_pretrained(model_id, **kwargs)
+    except Exception as exc:
+        if kwargs.get('attn_implementation') == 'flash_attention_2':
+            print(f'[train_vlm_grpo] flash_attention_2 load failed ({exc!r}); retrying with sdpa.', flush=True)
+            kwargs['attn_implementation'] = 'sdpa'
+            return model_cls.from_pretrained(model_id, **kwargs)
+        raise
 
 def _is_url(value: str) -> bool:
     return value.startswith('http://') or value.startswith('https://')
@@ -572,21 +634,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--train-file', type=Path, required=True)
     ap.add_argument('--eval-file', type=Path, default=None)
     ap.add_argument('--output-dir', type=Path, required=True)
-    ap.add_argument('--learning-rate', type=float, default=2e-5)
+    ap.add_argument('--learning-rate', type=float, default=1e-5)
     ap.add_argument('--num-train-epochs', type=float, default=1.0)
     ap.add_argument('--max-steps', type=int, default=-1)
     ap.add_argument('--per-device-train-batch-size', type=int, default=1)
     ap.add_argument('--per-device-eval-batch-size', type=int, default=1)
     ap.add_argument('--gradient-accumulation-steps', type=int, default=8)
-    ap.add_argument('--num-generations', type=int, default=4)
-    ap.add_argument('--max-completion-length', type=int, default=512)
-    ap.add_argument('--logging-steps', type=int, default=10)
-    ap.add_argument('--save-steps', type=int, default=100)
-    ap.add_argument('--eval-steps', type=int, default=100)
+    ap.add_argument('--num-generations', type=int, default=2)
+    ap.add_argument('--num-generations-eval', type=int, default=2)
+    ap.add_argument('--max-completion-length', type=int, default=384)
+    ap.add_argument('--logging-steps', type=int, default=5)
+    ap.add_argument('--save-steps', type=int, default=40)
+    ap.add_argument('--eval-steps', type=int, default=40)
     ap.add_argument('--save-total-limit', type=int, default=2)
     ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--lora-r', type=int, default=16)
-    ap.add_argument('--lora-alpha', type=int, default=32)
+    ap.add_argument('--lora-r', type=int, default=32)
+    ap.add_argument('--lora-alpha', type=int, default=64)
     ap.add_argument('--lora-dropout', type=float, default=0.05)
     ap.add_argument('--lora-target-modules', nargs='+', default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     ap.add_argument('--use-lora', action='store_true')
@@ -594,11 +657,28 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--sft-adapter-path', type=Path, default=None)
     ap.add_argument('--bf16', action='store_true')
     ap.add_argument('--fp16', action='store_true')
+    ap.add_argument('--tf32', action='store_true')
     ap.add_argument('--gradient-checkpointing', action='store_true')
-    ap.add_argument('--attn-implementation', default='sdpa')
+    ap.add_argument('--attn-implementation', default='auto', choices=['auto', 'sdpa', 'flash_attention_2', 'eager'])
+    ap.add_argument('--trust-remote-code', action='store_true')
     ap.add_argument('--train-mode', choices=['auto', 'text', 'vlm'], default='auto')
     ap.add_argument('--image-column', default='images')
-    ap.add_argument('--reward-weights', type=float, nargs=5, default=[1.0, 1.0, 1.0, 0.75, 1.0], help="Weights for: schema, temporal, graph, evidence, verdict")
+    ap.add_argument('--min-pixels', type=int, default=None)
+    ap.add_argument('--max-pixels', type=int, default=None)
+    ap.add_argument('--warmup-ratio', type=float, default=0.08)
+    ap.add_argument('--optim', default='adamw_torch_fused')
+    ap.add_argument('--lr-scheduler-type', default='cosine')
+    ap.add_argument('--weight-decay', type=float, default=0.0)
+    ap.add_argument('--max-grad-norm', type=float, default=0.3)
+    ap.add_argument('--dataloader-num-workers', type=int, default=2)
+    ap.add_argument('--temperature', type=float, default=0.8)
+    ap.add_argument('--top-p', type=float, default=0.95)
+    ap.add_argument('--top-k', type=int, default=0)
+    ap.add_argument('--mask-truncated-completions', action='store_true')
+    ap.add_argument('--importance-sampling-level', default='sequence', choices=['token', 'sequence'])
+    ap.add_argument('--multi-objective-aggregation', default='normalize_then_sum', choices=['sum_then_normalize', 'normalize_then_sum'])
+    ap.add_argument('--reward-weights', type=float, nargs='+', default=[0.0, 1.0, 0.8, 1.2, 0.5, 1.5], help="Weights for: label, schema, temporal, graph, evidence, verdict")
+    ap.add_argument('--log-completions', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
     return ap.parse_args()
 
@@ -606,6 +686,14 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.tf32:
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+    if len(args.reward_weights) != 6:
+        raise ValueError('--reward-weights must contain exactly 6 values: label, schema, temporal, graph, evidence, verdict')
     
     REWARD_LOGGER.path = args.output_dir / "grpo_reward_trace.jsonl"
 
@@ -627,15 +715,20 @@ def main() -> None:
     if eval_ds is not None: 
         eval_ds, _ = maybe_prepare_dataset(eval_ds, args.image_column, actual_mode)
 
-    processor = AutoProcessor.from_pretrained(args.model_id)
-    tokenizer = getattr(processor, 'tokenizer', None) or AutoTokenizer.from_pretrained(args.model_id)
+    processor = load_processor(args.model_id, args.min_pixels, args.max_pixels, args.trust_remote_code)
+    tokenizer = getattr(processor, 'tokenizer', None) or AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=args.trust_remote_code)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None: 
         tokenizer.pad_token = tokenizer.eos_token
     if hasattr(processor, "tokenizer") and getattr(processor.tokenizer, "pad_token", None) is None:
         processor.tokenizer.pad_token = tokenizer.pad_token
 
-    model = load_qwen_model(args.model_id, args.qlora, args.bf16, args.fp16, args.attn_implementation)
+    model = load_qwen_model(args.model_id, args.qlora, args.bf16, args.fp16, args.attn_implementation, args.trust_remote_code)
+    if args.gradient_checkpointing and hasattr(model, 'config'):
+        try:
+            model.config.use_cache = False
+        except Exception:
+            pass
     if args.qlora: 
         model = prepare_model_for_kbit_training(model)
         
@@ -643,6 +736,8 @@ def main() -> None:
         if PeftModel is None:
             raise RuntimeError('peft.PeftModel is required for --sft-adapter-path; install a full peft package.')
         model = PeftModel.from_pretrained(model, str(args.sft_adapter_path), is_trainable=True)
+        if args.gradient_checkpointing and hasattr(model, 'enable_input_require_grads'):
+            model.enable_input_require_grads()
     elif args.use_lora or args.qlora:
         model = get_peft_model(
             model,
@@ -655,8 +750,10 @@ def main() -> None:
                 task_type='CAUSAL_LM',
             ),
         )
+        if args.gradient_checkpointing and hasattr(model, 'enable_input_require_grads'):
+            model.enable_input_require_grads()
 
-    grpo_args = GRPOConfig(
+    grpo_kwargs = dict(
         output_dir=str(args.output_dir),
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_train_epochs,
@@ -664,9 +761,17 @@ def main() -> None:
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        warmup_ratio=args.warmup_ratio,
+        optim=args.optim,
+        lr_scheduler_type=args.lr_scheduler_type,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         num_generations=args.num_generations,
-        # max_prompt_length=None if actual_mode == "vlm" else 4096,
+        num_generations_eval=args.num_generations_eval,
         max_completion_length=args.max_completion_length,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         eval_steps=args.eval_steps,
@@ -674,14 +779,23 @@ def main() -> None:
         bf16=args.bf16,
         fp16=args.fp16,
         gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing_kwargs={'use_reentrant': False},
+        tf32=args.tf32,
         remove_unused_columns=False,
-        # reward_weights=args.reward_weights,
-        log_completions=True,
+        reward_weights=args.reward_weights,
+        mask_truncated_completions=args.mask_truncated_completions,
+        importance_sampling_level=args.importance_sampling_level,
+        multi_objective_aggregation=args.multi_objective_aggregation,
+        log_completions=args.log_completions,
         eval_strategy="steps" if eval_ds is not None else "no",
         save_strategy="steps",
         logging_strategy="steps",
         report_to=[],
+        dataloader_num_workers=args.dataloader_num_workers,
+        dataloader_pin_memory=True,
+        ddp_find_unused_parameters=False,
     )
+    grpo_args = GRPOConfig(**_supports_kwargs(GRPOConfig, grpo_kwargs))
 
     run_config = vars(args).copy()
     run_config['resolved_mode'] = actual_mode

@@ -197,7 +197,19 @@ def main() -> None:
     copy_tree(args.sft_dir, bundle_dir / "artifacts" / "sft_lora", exclude_roots=[bundle_dir])
     copy_tree(args.grpo_dir, bundle_dir / "artifacts" / "grpo_lora", exclude_roots=[bundle_dir])
 
-    for name in ["summary.json", "sft_train.jsonl", "sft_eval.jsonl", "grpo_train.jsonl", "grpo_eval.jsonl"]:
+    for name in [
+        "summary.json",
+        "README.md",
+        "export_summary.json",
+        "ARTICLE_IMAGE_SOURCES.md",
+        "article_image_sources.jsonl",
+        "sft_all.jsonl",
+        "sft_train.jsonl",
+        "sft_eval.jsonl",
+        "grpo_all.jsonl",
+        "grpo_train.jsonl",
+        "grpo_eval.jsonl",
+    ]:
         copy_file(args.data_dir / name, bundle_dir / "artifacts" / "data" / name)
 
     for archive in [
